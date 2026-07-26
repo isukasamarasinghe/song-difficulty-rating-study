@@ -5,7 +5,6 @@ import hmac
 import io
 import re
 import secrets
-from pathlib import Path
 
 from flask import (
     Blueprint,
@@ -16,20 +15,11 @@ from flask import (
     redirect,
     render_template,
     request,
-    send_file,
     session,
     url_for,
 )
 
-from .storage import (
-    DIFFICULTIES,
-    consensus_rows,
-    dashboard_stats,
-    get_song,
-    next_song,
-    rating_rows,
-    save_rating,
-)
+from .storage import DIFFICULTIES, SupabaseError
 
 
 rating_bp = Blueprint("rating", __name__)
@@ -47,6 +37,10 @@ INSTRUMENTS = (
 
 def _matches(provided: str, expected: str) -> bool:
     return bool(provided and expected and hmac.compare_digest(provided, expected))
+
+
+def _repository():
+    return current_app.extensions["rating_repository"]
 
 
 @rating_bp.before_app_request
@@ -94,6 +88,15 @@ def template_values():
     return {"csrf_token": _csrf_token()}
 
 
+@rating_bp.app_errorhandler(SupabaseError)
+def handle_supabase_error(error: SupabaseError):
+    current_app.logger.exception("Supabase operation failed: %s", error)
+    return (
+        "The rating service is temporarily unavailable. Please try again shortly.",
+        503,
+    )
+
+
 @rating_bp.get("/health")
 def health():
     return {"status": "ok"}
@@ -105,7 +108,7 @@ def index():
     song = None
     rated = total = 0
     if rater_key:
-        song, rated, total = next_song(current_app.config["DATABASE_PATH"], rater_key)
+        song, rated, total = _repository().next_song(rater_key)
     return render_template(
         "rate.html",
         song=song,
@@ -166,7 +169,7 @@ def rate():
         confidence = int(request.form.get("confidence", ""))
     except ValueError:
         confidence = 0
-    song = get_song(current_app.config["DATABASE_PATH"], song_id)
+    song = _repository().get_song(song_id)
 
     errors = []
     if song is None:
@@ -180,8 +183,7 @@ def rate():
             flash(error, "danger")
         return redirect(url_for("rating.index"))
 
-    save_rating(
-        current_app.config["DATABASE_PATH"],
+    _repository().save_rating(
         {
             "song_id": song_id,
             "rater_id": session["rater_id"],
@@ -209,21 +211,15 @@ def reset_participant():
 def audio(song_id: str):
     if not session.get("rater_key"):
         abort(404)
-    song = get_song(current_app.config["DATABASE_PATH"], song_id)
+    song = _repository().get_song(song_id)
     if song is None:
         abort(404)
-    audio_root = current_app.config["AUDIO_DIR"].resolve()
-    path = (audio_root / song["filename"]).resolve()
-    if audio_root not in path.parents or not path.is_file():
-        abort(404)
-    return send_file(path, conditional=True)
+    return redirect(_repository().signed_audio_url(song["storage_path"]))
 
 
 @rating_bp.get("/admin")
 def admin():
-    return render_template(
-        "admin.html", stats=dashboard_stats(current_app.config["DATABASE_PATH"])
-    )
+    return render_template("admin.html", stats=_repository().dashboard_stats())
 
 
 def _csv_download(rows: list[dict], filename: str) -> Response:
@@ -243,16 +239,13 @@ def _csv_download(rows: list[dict], filename: str) -> Response:
 
 @rating_bp.get("/admin/export/ratings.csv")
 def export_ratings():
-    return _csv_download(
-        rating_rows(current_app.config["DATABASE_PATH"]), "musician_ratings.csv"
-    )
+    return _csv_download(_repository().rating_rows(), "musician_ratings.csv")
 
 
 @rating_bp.get("/admin/export/consensus.csv")
 def export_consensus():
     return _csv_download(
-        consensus_rows(
-            current_app.config["DATABASE_PATH"],
+        _repository().consensus_rows(
             current_app.config["MINIMUM_RATERS"],
             current_app.config["MINIMUM_AGREEMENT"],
         ),

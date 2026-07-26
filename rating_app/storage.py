@@ -1,80 +1,21 @@
 from __future__ import annotations
 
 import hashlib
-import sqlite3
+import mimetypes
 from collections import Counter
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
+
+import requests
 
 
-AUDIO_EXTENSIONS = {".mp3", ".wav"}
 DIFFICULTIES = ("Beginner", "Intermediate", "Advanced")
+AUDIO_EXTENSIONS = {".mp3", ".wav"}
 
 
-@contextmanager
-def _connect(database_path: Path):
-    connection = sqlite3.connect(database_path, timeout=10)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 10000")
-    try:
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-
-def initialize_database(database_path: Path) -> None:
-    database_path.parent.mkdir(parents=True, exist_ok=True)
-    with _connect(database_path) as connection:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS songs (
-                song_id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL UNIQUE,
-                sha256 TEXT NOT NULL UNIQUE,
-                title TEXT NOT NULL,
-                artist TEXT NOT NULL DEFAULT '',
-                file_size INTEGER NOT NULL,
-                mtime_ns INTEGER NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE IF NOT EXISTS ratings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                song_id TEXT NOT NULL REFERENCES songs(song_id),
-                rater_id TEXT NOT NULL,
-                rater_key TEXT NOT NULL,
-                instrument TEXT NOT NULL,
-                experience_years REAL NOT NULL,
-                difficulty TEXT NOT NULL CHECK (
-                    difficulty IN ('Beginner', 'Intermediate', 'Advanced')
-                ),
-                confidence INTEGER NOT NULL CHECK (confidence BETWEEN 1 AND 5),
-                comment TEXT NOT NULL DEFAULT '',
-                rated_at TEXT NOT NULL,
-                UNIQUE(song_id, rater_key)
-            );
-
-            CREATE INDEX IF NOT EXISTS ratings_rater_key_idx
-                ON ratings(rater_key);
-            CREATE INDEX IF NOT EXISTS ratings_song_id_idx
-                ON ratings(song_id);
-            """
-        )
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+class SupabaseError(RuntimeError):
+    pass
 
 
 def _title_artist(path: Path) -> tuple[str, str]:
@@ -89,235 +30,281 @@ def _title_artist(path: Path) -> tuple[str, str]:
     return stem, ""
 
 
-def sync_audio_catalog(database_path: Path, audio_dir: Path) -> int:
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    files = sorted(
-        path
-        for path in audio_dir.rglob("*")
-        if path.is_file() and path.suffix.casefold() in AUDIO_EXTENSIONS
-    )
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    with _connect(database_path) as connection:
-        existing = {
-            row["filename"]: row
-            for row in connection.execute("SELECT * FROM songs").fetchall()
-        }
-        connection.execute("UPDATE songs SET enabled = 0")
 
-        for path in files:
-            relative_name = path.relative_to(audio_dir).as_posix()
-            stat = path.stat()
-            previous = existing.get(relative_name)
-            if (
-                previous
-                and previous["file_size"] == stat.st_size
-                and previous["mtime_ns"] == stat.st_mtime_ns
-            ):
-                audio_hash = previous["sha256"]
-            else:
-                audio_hash = _sha256(path)
-
-            song_id = audio_hash[:16]
-            title, artist = _title_artist(path)
-            connection.execute(
-                "DELETE FROM songs WHERE filename = ? AND song_id <> ?",
-                (relative_name, song_id),
+class SupabaseRepository:
+    def __init__(self, url: str, secret_key: str, bucket: str = "rating-audio"):
+        self.url = url.rstrip("/")
+        self.secret_key = secret_key.strip()
+        self.bucket = bucket.strip()
+        if not self.url or not self.secret_key or not self.bucket:
+            raise ValueError(
+                "SUPABASE_URL, SUPABASE_SECRET_KEY, and SUPABASE_BUCKET are required"
             )
-            connection.execute(
-                """
-                INSERT INTO songs (
-                    song_id, filename, sha256, title, artist,
-                    file_size, mtime_ns, enabled
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(song_id) DO UPDATE SET
-                    filename = excluded.filename,
-                    title = excluded.title,
-                    artist = excluded.artist,
-                    file_size = excluded.file_size,
-                    mtime_ns = excluded.mtime_ns,
-                    enabled = 1
-                """,
-                (
-                    song_id,
-                    relative_name,
-                    audio_hash,
-                    title,
-                    artist,
-                    stat.st_size,
-                    stat.st_mtime_ns,
-                ),
-            )
-    return len(files)
-
-
-def next_song(database_path: Path, rater_key: str) -> tuple[dict | None, int, int]:
-    with _connect(database_path) as connection:
-        songs = [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT s.*, COUNT(r.id) AS rating_count
-                FROM songs s
-                LEFT JOIN ratings r ON r.song_id = s.song_id
-                WHERE s.enabled = 1
-                  AND NOT EXISTS (
-                      SELECT 1 FROM ratings own
-                      WHERE own.song_id = s.song_id AND own.rater_key = ?
-                  )
-                GROUP BY s.song_id
-                """,
-                (rater_key,),
-            ).fetchall()
-        ]
-        total = connection.execute(
-            "SELECT COUNT(*) FROM songs WHERE enabled = 1"
-        ).fetchone()[0]
-        rated = connection.execute(
-            "SELECT COUNT(*) FROM ratings WHERE rater_key = ?",
-            (rater_key,),
-        ).fetchone()[0]
-
-    if not songs:
-        return None, rated, total
-    minimum_count = min(song["rating_count"] for song in songs)
-    candidates = [song for song in songs if song["rating_count"] == minimum_count]
-    candidates.sort(
-        key=lambda song: hashlib.sha256(
-            f"{rater_key}:{song['song_id']}".encode("utf-8")
-        ).hexdigest()
-    )
-    return candidates[0], rated, total
-
-
-def get_song(database_path: Path, song_id: str) -> dict | None:
-    with _connect(database_path) as connection:
-        row = connection.execute(
-            "SELECT * FROM songs WHERE song_id = ? AND enabled = 1", (song_id,)
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def save_rating(database_path: Path, rating: dict) -> None:
-    rated_at = datetime.now(timezone.utc).isoformat()
-    with _connect(database_path) as connection:
-        connection.execute(
-            """
-            INSERT INTO ratings (
-                song_id, rater_id, rater_key, instrument, experience_years,
-                difficulty, confidence, comment, rated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(song_id, rater_key) DO UPDATE SET
-                rater_id = excluded.rater_id,
-                instrument = excluded.instrument,
-                experience_years = excluded.experience_years,
-                difficulty = excluded.difficulty,
-                confidence = excluded.confidence,
-                comment = excluded.comment,
-                rated_at = excluded.rated_at
-            """,
-            (
-                rating["song_id"],
-                rating["rater_id"],
-                rating["rater_key"],
-                rating["instrument"],
-                rating["experience_years"],
-                rating["difficulty"],
-                rating["confidence"],
-                rating.get("comment", ""),
-                rated_at,
-            ),
-        )
-
-
-def dashboard_stats(database_path: Path) -> dict:
-    with _connect(database_path) as connection:
-        total_songs = connection.execute(
-            "SELECT COUNT(*) FROM songs WHERE enabled = 1"
-        ).fetchone()[0]
-        total_ratings = connection.execute("SELECT COUNT(*) FROM ratings").fetchone()[0]
-        total_raters = connection.execute(
-            "SELECT COUNT(DISTINCT rater_key) FROM ratings"
-        ).fetchone()[0]
-        song_rows = connection.execute(
-            """
-            SELECT s.song_id, s.title, s.artist, COUNT(r.id) AS rating_count
-            FROM songs s LEFT JOIN ratings r ON r.song_id = s.song_id
-            WHERE s.enabled = 1
-            GROUP BY s.song_id
-            ORDER BY rating_count, s.artist, s.title
-            """
-        ).fetchall()
-    songs = [dict(row) for row in song_rows]
-    return {
-        "total_songs": total_songs,
-        "total_ratings": total_ratings,
-        "total_raters": total_raters,
-        "songs_with_three": sum(song["rating_count"] >= 3 for song in songs),
-        "songs": songs,
-    }
-
-
-def rating_rows(database_path: Path) -> list[dict]:
-    with _connect(database_path) as connection:
-        rows = connection.execute(
-            """
-            SELECT r.song_id, s.title, s.artist, r.rater_id, r.instrument,
-                   r.experience_years, r.difficulty, r.confidence,
-                   r.comment, r.rated_at
-            FROM ratings r JOIN songs s ON s.song_id = r.song_id
-            ORDER BY s.artist, s.title, r.rater_key
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def consensus_rows(
-    database_path: Path, minimum_raters: int, minimum_agreement: float
-) -> list[dict]:
-    with _connect(database_path) as connection:
-        songs = connection.execute(
-            "SELECT song_id, title, artist FROM songs WHERE enabled = 1 ORDER BY artist, title"
-        ).fetchall()
-        ratings = connection.execute(
-            "SELECT song_id, difficulty FROM ratings"
-        ).fetchall()
-
-    by_song: dict[str, list[str]] = {}
-    for row in ratings:
-        by_song.setdefault(row["song_id"], []).append(row["difficulty"])
-
-    output = []
-    for song in songs:
-        labels = by_song.get(song["song_id"], [])
-        counts = Counter(labels)
-        num_ratings = len(labels)
-        agreement = 0.0
-        consensus = ""
-        status = f"needs at least {minimum_raters} ratings"
-        if num_ratings >= minimum_raters and counts:
-            top_count = max(counts.values())
-            winners = [label for label, count in counts.items() if count == top_count]
-            agreement = top_count / num_ratings
-            if len(winners) > 1:
-                status = "tied ratings"
-            elif agreement < minimum_agreement:
-                status = f"agreement below {minimum_agreement:.0%}"
-            else:
-                consensus = winners[0]
-                status = "accepted"
-
-        output.append(
+        self.session = requests.Session()
+        self.session.headers.update(
             {
-                "song_id": song["song_id"],
-                "title": song["title"],
-                "artist": song["artist"],
-                "difficulty": consensus,
-                "num_ratings": num_ratings,
-                "agreement": f"{agreement:.4f}",
-                "beginner_ratings": counts.get("Beginner", 0),
-                "intermediate_ratings": counts.get("Intermediate", 0),
-                "advanced_ratings": counts.get("Advanced", 0),
-                "status": status,
+                "apikey": self.secret_key,
+                "Accept": "application/json",
+                "User-Agent": "song-difficulty-rating-study/1.0",
             }
         )
-    return output
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        json: dict | list | None = None,
+        headers: dict | None = None,
+        timeout: int = 30,
+    ) -> requests.Response:
+        try:
+            response = self.session.request(
+                method,
+                f"{self.url}{path}",
+                params=params,
+                json=json,
+                headers=headers,
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            raise SupabaseError("Could not connect to the study database") from exc
+        if not response.ok:
+            detail = response.text[:500]
+            raise SupabaseError(
+                f"Supabase request failed ({response.status_code}): {detail}"
+            )
+        return response
+
+    def _get_rows(self, table: str, params: dict | None = None) -> list[dict]:
+        response = self._request("GET", f"/rest/v1/{table}", params=params)
+        return list(response.json())
+
+    def songs(self, enabled_only: bool = True) -> list[dict]:
+        params = {"select": "*", "order": "artist.asc,title.asc"}
+        if enabled_only:
+            params["enabled"] = "eq.true"
+        return self._get_rows("songs", params)
+
+    def ratings(self) -> list[dict]:
+        return self._get_rows("ratings", {"select": "*", "order": "rated_at.asc"})
+
+    def next_song(self, rater_key: str) -> tuple[dict | None, int, int]:
+        songs = self.songs()
+        ratings = self.ratings()
+        own_song_ids = {
+            row["song_id"] for row in ratings if row["rater_key"] == rater_key
+        }
+        rating_counts = Counter(row["song_id"] for row in ratings)
+        candidates = [song for song in songs if song["song_id"] not in own_song_ids]
+        if not candidates:
+            return None, len(own_song_ids), len(songs)
+
+        minimum_count = min(rating_counts[song["song_id"]] for song in candidates)
+        candidates = [
+            song
+            for song in candidates
+            if rating_counts[song["song_id"]] == minimum_count
+        ]
+        candidates.sort(
+            key=lambda song: hashlib.sha256(
+                f"{rater_key}:{song['song_id']}".encode("utf-8")
+            ).hexdigest()
+        )
+        return candidates[0], len(own_song_ids), len(songs)
+
+    def get_song(self, song_id: str) -> dict | None:
+        rows = self._get_rows(
+            "songs",
+            {
+                "select": "*",
+                "song_id": f"eq.{song_id}",
+                "enabled": "eq.true",
+                "limit": "1",
+            },
+        )
+        return rows[0] if rows else None
+
+    def save_rating(self, rating: dict) -> None:
+        payload = {
+            **rating,
+            "rated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._request(
+            "POST",
+            "/rest/v1/ratings",
+            params={"on_conflict": "song_id,rater_key"},
+            json=payload,
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+
+    def dashboard_stats(self) -> dict:
+        songs = self.songs()
+        ratings = self.ratings()
+        counts = Counter(row["song_id"] for row in ratings)
+        song_rows = [
+            {**song, "rating_count": counts[song["song_id"]]} for song in songs
+        ]
+        song_rows.sort(key=lambda row: (row["rating_count"], row["artist"], row["title"]))
+        return {
+            "total_songs": len(songs),
+            "total_ratings": len(ratings),
+            "total_raters": len({row["rater_key"] for row in ratings}),
+            "songs_with_three": sum(row["rating_count"] >= 3 for row in song_rows),
+            "songs": song_rows,
+        }
+
+    def rating_rows(self) -> list[dict]:
+        songs = {row["song_id"]: row for row in self.songs(enabled_only=False)}
+        output = []
+        for rating in self.ratings():
+            song = songs.get(rating["song_id"], {})
+            output.append(
+                {
+                    "song_id": rating["song_id"],
+                    "title": song.get("title", ""),
+                    "artist": song.get("artist", ""),
+                    "rater_id": rating["rater_id"],
+                    "instrument": rating["instrument"],
+                    "experience_years": rating["experience_years"],
+                    "difficulty": rating["difficulty"],
+                    "confidence": rating["confidence"],
+                    "comment": rating.get("comment", ""),
+                    "rated_at": rating["rated_at"],
+                }
+            )
+        return output
+
+    def consensus_rows(
+        self, minimum_raters: int, minimum_agreement: float
+    ) -> list[dict]:
+        ratings_by_song: dict[str, list[str]] = {}
+        for rating in self.ratings():
+            ratings_by_song.setdefault(rating["song_id"], []).append(
+                rating["difficulty"]
+            )
+
+        output = []
+        for song in self.songs():
+            labels = ratings_by_song.get(song["song_id"], [])
+            counts = Counter(labels)
+            num_ratings = len(labels)
+            agreement = 0.0
+            consensus = ""
+            status = f"needs at least {minimum_raters} ratings"
+            if num_ratings >= minimum_raters and counts:
+                top_count = max(counts.values())
+                winners = [
+                    label for label, count in counts.items() if count == top_count
+                ]
+                agreement = top_count / num_ratings
+                if len(winners) > 1:
+                    status = "tied ratings"
+                elif agreement < minimum_agreement:
+                    status = f"agreement below {minimum_agreement:.0%}"
+                else:
+                    consensus = winners[0]
+                    status = "accepted"
+
+            output.append(
+                {
+                    "song_id": song["song_id"],
+                    "audio_sha256": song["sha256"],
+                    "title": song["title"],
+                    "artist": song["artist"],
+                    "difficulty": consensus,
+                    "num_ratings": num_ratings,
+                    "agreement": f"{agreement:.4f}",
+                    "beginner_ratings": counts.get("Beginner", 0),
+                    "intermediate_ratings": counts.get("Intermediate", 0),
+                    "advanced_ratings": counts.get("Advanced", 0),
+                    "status": status,
+                }
+            )
+        return output
+
+    def signed_audio_url(self, storage_path: str, expires_in: int = 900) -> str:
+        encoded = quote(f"{self.bucket}/{storage_path}", safe="/")
+        response = self._request(
+            "POST",
+            f"/storage/v1/object/sign/{encoded}",
+            json={"expiresIn": expires_in},
+        )
+        signed_url = response.json().get("signedURL", "")
+        if not signed_url:
+            raise SupabaseError("Supabase did not return a signed audio URL")
+        if signed_url.startswith("http://") or signed_url.startswith("https://"):
+            return signed_url
+        if signed_url.startswith("/storage/v1/"):
+            return f"{self.url}{signed_url}"
+        return f"{self.url}/storage/v1{signed_url}"
+
+    def ensure_private_bucket(self) -> None:
+        response = self.session.get(
+            f"{self.url}/storage/v1/bucket/{quote(self.bucket, safe='')}", timeout=30
+        )
+        if response.status_code == 404:
+            self._request(
+                "POST",
+                "/storage/v1/bucket",
+                json={
+                    "id": self.bucket,
+                    "name": self.bucket,
+                    "public": False,
+                    "file_size_limit": 50 * 1024 * 1024,
+                    "allowed_mime_types": ["audio/mpeg", "audio/wav", "audio/x-wav"],
+                },
+            )
+        elif not response.ok:
+            raise SupabaseError(
+                f"Could not inspect the storage bucket ({response.status_code})"
+            )
+
+    def upload_song(self, path: Path) -> dict:
+        audio_hash = file_sha256(path)
+        song_id = audio_hash[:16]
+        storage_path = f"{song_id}{path.suffix.casefold()}"
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        encoded = quote(f"{self.bucket}/{storage_path}", safe="/")
+        try:
+            with path.open("rb") as handle:
+                response = self.session.post(
+                    f"{self.url}/storage/v1/object/{encoded}",
+                    data=handle,
+                    headers={"Content-Type": content_type, "x-upsert": "true"},
+                    timeout=300,
+                )
+        except requests.RequestException as exc:
+            raise SupabaseError(f"Could not upload {path.name}") from exc
+        if not response.ok:
+            raise SupabaseError(
+                f"Upload failed for {path.name} ({response.status_code}): "
+                f"{response.text[:300]}"
+            )
+
+        title, artist = _title_artist(path)
+        song = {
+            "song_id": song_id,
+            "filename": path.name,
+            "storage_path": storage_path,
+            "sha256": audio_hash,
+            "title": title,
+            "artist": artist,
+            "enabled": True,
+        }
+        self._request(
+            "POST",
+            "/rest/v1/songs",
+            params={"on_conflict": "song_id"},
+            json=song,
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+        return song

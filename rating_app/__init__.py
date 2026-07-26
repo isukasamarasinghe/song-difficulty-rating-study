@@ -8,7 +8,7 @@ from flask import Flask
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .routes import rating_bp
-from .storage import initialize_database, sync_audio_catalog
+from .storage import SupabaseRepository
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,19 +28,14 @@ def _load_local_environment(path: Path) -> None:
 def create_app(test_config: dict | None = None) -> Flask:
     _load_local_environment(PROJECT_ROOT / ".env")
 
-    data_root = Path(os.environ.get("DATA_ROOT", PROJECT_ROOT / "data"))
-    audio_dir = Path(os.environ.get("AUDIO_DIR", data_root / "audio"))
-    database_path = Path(
-        os.environ.get("DATABASE_PATH", data_root / "ratings.sqlite3")
-    )
-
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config.from_mapping(
         SECRET_KEY=os.environ.get("SECRET_KEY", "local-development-key"),
         INVITE_TOKEN=os.environ.get("INVITE_TOKEN", ""),
         ADMIN_TOKEN=os.environ.get("ADMIN_TOKEN", ""),
-        AUDIO_DIR=audio_dir,
-        DATABASE_PATH=database_path,
+        SUPABASE_URL=os.environ.get("SUPABASE_URL", ""),
+        SUPABASE_SECRET_KEY=os.environ.get("SUPABASE_SECRET_KEY", ""),
+        SUPABASE_BUCKET=os.environ.get("SUPABASE_BUCKET", "rating-audio"),
         MINIMUM_RATERS=3,
         MINIMUM_AGREEMENT=0.60,
         MAX_CONTENT_LENGTH=16 * 1024,
@@ -52,11 +47,15 @@ def create_app(test_config: dict | None = None) -> Flask:
     if test_config:
         app.config.update(test_config)
 
-    app.config["AUDIO_DIR"] = Path(app.config["AUDIO_DIR"])
-    app.config["DATABASE_PATH"] = Path(app.config["DATABASE_PATH"])
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-    initialize_database(app.config["DATABASE_PATH"])
-    sync_audio_catalog(app.config["DATABASE_PATH"], app.config["AUDIO_DIR"])
+    repository = app.config.get("REPOSITORY")
+    if repository is None:
+        repository = SupabaseRepository(
+            app.config["SUPABASE_URL"],
+            app.config["SUPABASE_SECRET_KEY"],
+            app.config["SUPABASE_BUCKET"],
+        )
+    app.extensions["rating_repository"] = repository
     app.register_blueprint(rating_bp)
     return app
