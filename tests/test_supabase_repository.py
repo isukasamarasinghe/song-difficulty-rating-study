@@ -7,6 +7,32 @@ from rating_app.storage import SupabaseRepository
 
 
 class SupabaseRepositoryTests(unittest.TestCase):
+    def test_missing_bucket_response_creates_private_bucket(self) -> None:
+        repository = SupabaseRepository(
+            "https://project.supabase.co", "sb_secret_test", "rating-audio"
+        )
+        missing_response = Mock(status_code=400, ok=False)
+        repository.session.get = Mock(return_value=missing_response)
+        repository._request = Mock()
+
+        repository.ensure_private_bucket()
+
+        repository._request.assert_called_once_with(
+            "POST",
+            "/storage/v1/bucket",
+            json={
+                "id": "rating-audio",
+                "name": "rating-audio",
+                "public": False,
+                "file_size_limit": 50 * 1024 * 1024,
+                "allowed_mime_types": [
+                    "audio/mpeg",
+                    "audio/wav",
+                    "audio/x-wav",
+                ],
+            },
+        )
+
     def test_secret_is_sent_as_api_key_and_signed_url_is_expanded(self) -> None:
         repository = SupabaseRepository(
             "https://project.supabase.co/", "sb_secret_test", "rating-audio"

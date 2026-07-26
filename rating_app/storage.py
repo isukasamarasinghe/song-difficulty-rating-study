@@ -251,7 +251,10 @@ class SupabaseRepository:
         response = self.session.get(
             f"{self.url}/storage/v1/bucket/{quote(self.bucket, safe='')}", timeout=30
         )
-        if response.status_code == 404:
+        # Supabase Storage currently returns 400 (rather than 404) when a
+        # requested bucket does not exist. Both responses mean it is safe to
+        # create the private bucket.
+        if response.status_code in {400, 404}:
             self._request(
                 "POST",
                 "/storage/v1/bucket",
