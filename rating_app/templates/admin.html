@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Study Progress{% endblock %}
+{% block content %}
+<div class="progress-row">
+    <div>
+        <div class="eyebrow accent">PRIVATE ADMINISTRATION</div>
+        <h1>Collection progress</h1>
+    </div>
+    <div class="admin-actions">
+        <a class="secondary-button" href="{{ url_for('rating.export_ratings') }}">Download raw ratings</a>
+        <a class="primary-button" href="{{ url_for('rating.export_consensus') }}">Download consensus</a>
+    </div>
+</div>
+<div class="stat-grid">
+    <div class="stat-card"><strong>{{ stats.total_songs }}</strong><span>Songs</span></div>
+    <div class="stat-card"><strong>{{ stats.total_ratings }}</strong><span>Ratings</span></div>
+    <div class="stat-card"><strong>{{ stats.total_raters }}</strong><span>Musicians</span></div>
+    <div class="stat-card"><strong>{{ stats.songs_with_three }}</strong><span>Songs with 3+ ratings</span></div>
+</div>
+<section class="card table-card">
+    <table>
+        <thead><tr><th>Song</th><th>Artist</th><th>Ratings</th></tr></thead>
+        <tbody>
+            {% for song in stats.songs %}
+            <tr><td>{{ song.title }}</td><td>{{ song.artist or '—' }}</td><td>{{ song.rating_count }}</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

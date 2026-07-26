@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block content %}
+{% if not participant_ready %}
+<section class="card intro-card">
+    <div class="eyebrow accent">BEFORE YOU BEGIN</div>
+    <h1>Help us understand how difficult songs are to perform.</h1>
+    <p>Listen to each song and rate its overall performance difficulty from your perspective as a musician. The analyser's predictions are hidden to prevent bias.</p>
+    <ul class="compact-list">
+        <li>Do not enter your name or email address.</li>
+        <li>Use the same anonymous ID whenever you return.</li>
+        <li>You may stop at any time and continue later.</li>
+    </ul>
+</section>
+
+<form class="card form-card" method="post" action="{{ url_for('rating.participant') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="form-grid">
+        <label>
+            <span>Anonymous participant ID</span>
+            <input name="rater_id" value="{{ participant.rater_id }}" placeholder="e.g. musician_07" pattern="[A-Za-z0-9_-]{2,40}" required>
+        </label>
+        <label>
+            <span>Main instrument</span>
+            <select name="instrument" required>
+                <option value="">Choose...</option>
+                {% for instrument in instruments %}<option value="{{ instrument }}">{{ instrument }}</option>{% endfor %}
+            </select>
+        </label>
+        <label>
+            <span>Years of playing experience</span>
+            <input type="number" name="experience_years" min="0" max="80" step="0.5" required>
+        </label>
+    </div>
+    <label class="consent-row">
+        <input type="checkbox" name="consent" value="yes" required>
+        <span>I voluntarily consent to my anonymous ratings being used for this research study. I understand that I should not provide identifying information.</span>
+    </label>
+    <button class="primary-button" type="submit">Start rating songs</button>
+</form>
+{% elif song %}
+<div class="progress-row">
+    <div>
+        <div class="eyebrow accent">SONG {{ rated + 1 }} OF {{ total }}</div>
+        <h1>{{ song.title }}</h1>
+        {% if song.artist %}<p class="artist">{{ song.artist }}</p>{% endif %}
+    </div>
+    <div class="progress-number">{{ rated }}/{{ total }} rated</div>
+</div>
+
+<section class="card player-card">
+    <p>Listen to enough of the song to judge how difficult it would be to perform accurately.</p>
+    <audio controls preload="metadata">
+        <source src="{{ url_for('rating.audio', song_id=song.song_id) }}">
+        Your browser does not support audio playback.
+    </audio>
+</section>
+
+<form class="card form-card" method="post" action="{{ url_for('rating.rate') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="song_id" value="{{ song.song_id }}">
+    <fieldset>
+        <legend>Overall performance difficulty</legend>
+        <div class="difficulty-grid">
+            {% for difficulty in difficulties %}
+            <label class="difficulty-choice">
+                <input type="radio" name="difficulty" value="{{ difficulty }}" required>
+                <span>{{ difficulty }}</span>
+            </label>
+            {% endfor %}
+        </div>
+        <p class="help-text"><strong>Beginner:</strong> simple and steady &nbsp; <strong>Intermediate:</strong> some changes or technique &nbsp; <strong>Advanced:</strong> demanding harmony, speed, rhythm, or technique</p>
+    </fieldset>
+    <label>
+        <span>Confidence in your rating: <strong id="confidence-value">3</strong>/5</span>
+        <input type="range" name="confidence" min="1" max="5" value="3" oninput="document.getElementById('confidence-value').textContent=this.value">
+    </label>
+    <label>
+        <span>Optional reason</span>
+        <textarea name="comment" maxlength="1000" rows="3" placeholder="What makes this song easy or difficult to perform?"></textarea>
+    </label>
+    <button class="primary-button" type="submit">Save and show next song</button>
+</form>
+
+<form method="post" action="{{ url_for('rating.reset_participant') }}" class="reset-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="link-button" type="submit">Change participant ID</button>
+</form>
+{% else %}
+<section class="card complete-card">
+    <div class="completion-mark">✓</div>
+    <h1>All available songs are complete.</h1>
+    <p>Thank you. You rated {{ rated }} songs. Your anonymous responses have been saved.</p>
+</section>
+{% endif %}
+{% endblock %}
