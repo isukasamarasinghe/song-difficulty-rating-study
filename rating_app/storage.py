@@ -18,6 +18,31 @@ class SupabaseError(RuntimeError):
     pass
 
 
+def _consensus_result(
+    labels: list[str], minimum_raters: int, minimum_agreement: float
+) -> tuple[str, float, str, Counter]:
+    """Return the consensus label, agreement, status, and label counts."""
+    counts = Counter(labels)
+    num_ratings = len(labels)
+    agreement = 0.0
+    consensus = ""
+    status = f"needs at least {minimum_raters} ratings"
+
+    if num_ratings >= minimum_raters and counts:
+        top_count = max(counts.values())
+        winners = [label for label, count in counts.items() if count == top_count]
+        agreement = top_count / num_ratings
+        if len(winners) > 1:
+            status = "tied ratings"
+        elif agreement < minimum_agreement:
+            status = f"agreement below {minimum_agreement:.0%}"
+        else:
+            consensus = winners[0]
+            status = "accepted"
+
+    return consensus, agreement, status, counts
+
+
 def _title_artist(path: Path) -> tuple[str, str]:
     stem = path.stem.replace("_", " ").strip()
     if stem.endswith("]") and " [" in stem:
@@ -97,16 +122,44 @@ class SupabaseRepository:
     def ratings(self) -> list[dict]:
         return self._get_rows("ratings", {"select": "*", "order": "rated_at.asc"})
 
-    def next_song(self, rater_key: str) -> tuple[dict | None, int, int]:
+    def next_song(
+        self,
+        rater_key: str,
+        minimum_raters: int = 3,
+        minimum_agreement: float = 0.60,
+    ) -> tuple[dict | None, int, int]:
         songs = self.songs()
         ratings = self.ratings()
+        labels_by_song: dict[str, list[str]] = {}
+        for row in ratings:
+            labels_by_song.setdefault(row["song_id"], []).append(row["difficulty"])
+
+        unresolved_songs = []
+        for song in songs:
+            _, _, status, _ = _consensus_result(
+                labels_by_song.get(song["song_id"], []),
+                minimum_raters,
+                minimum_agreement,
+            )
+            if status != "accepted":
+                unresolved_songs.append(song)
+
         own_song_ids = {
             row["song_id"] for row in ratings if row["rater_key"] == rater_key
         }
         rating_counts = Counter(row["song_id"] for row in ratings)
-        candidates = [song for song in songs if song["song_id"] not in own_song_ids]
+        unresolved_ids = {song["song_id"] for song in unresolved_songs}
+        candidates = [
+            song
+            for song in unresolved_songs
+            if song["song_id"] not in own_song_ids
+        ]
         if not candidates:
-            return None, len(own_song_ids), len(songs)
+            return (
+                None,
+                len(own_song_ids & unresolved_ids),
+                len(unresolved_songs),
+            )
 
         minimum_count = min(rating_counts[song["song_id"]] for song in candidates)
         candidates = [
@@ -119,7 +172,11 @@ class SupabaseRepository:
                 f"{rater_key}:{song['song_id']}".encode("utf-8")
             ).hexdigest()
         )
-        return candidates[0], len(own_song_ids), len(songs)
+        return (
+            candidates[0],
+            len(own_song_ids & unresolved_ids),
+            len(unresolved_songs),
+        )
 
     def get_song(self, song_id: str) -> dict | None:
         rows = self._get_rows(
@@ -195,24 +252,10 @@ class SupabaseRepository:
         output = []
         for song in self.songs():
             labels = ratings_by_song.get(song["song_id"], [])
-            counts = Counter(labels)
             num_ratings = len(labels)
-            agreement = 0.0
-            consensus = ""
-            status = f"needs at least {minimum_raters} ratings"
-            if num_ratings >= minimum_raters and counts:
-                top_count = max(counts.values())
-                winners = [
-                    label for label, count in counts.items() if count == top_count
-                ]
-                agreement = top_count / num_ratings
-                if len(winners) > 1:
-                    status = "tied ratings"
-                elif agreement < minimum_agreement:
-                    status = f"agreement below {minimum_agreement:.0%}"
-                else:
-                    consensus = winners[0]
-                    status = "accepted"
+            consensus, agreement, status, counts = _consensus_result(
+                labels, minimum_raters, minimum_agreement
+            )
 
             output.append(
                 {

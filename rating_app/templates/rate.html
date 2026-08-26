@@ -40,11 +40,11 @@
 {% elif song %}
 <div class="progress-row">
     <div>
-        <div class="eyebrow accent">SONG {{ rated + 1 }} OF {{ total }}</div>
+        <div class="eyebrow accent">CONSENSUS FOLLOW-UP</div>
         <h1>{{ song.title }}</h1>
         {% if song.artist %}<p class="artist">{{ song.artist }}</p>{% endif %}
     </div>
-    <div class="progress-number">{{ rated }}/{{ total }} rated</div>
+    <div class="progress-number">{{ total }} unresolved song{% if total != 1 %}s{% endif %} currently remain</div>
 </div>
 
 <section class="card player-card">
@@ -88,8 +88,8 @@
 {% else %}
 <section class="card complete-card">
     <div class="completion-mark">✓</div>
-    <h1>All available songs are complete.</h1>
-    <p>Thank you. You rated {{ rated }} songs. Your anonymous responses have been saved.</p>
+    <h1>No unresolved songs are available to you.</h1>
+    <p>Thank you. You have rated every currently unresolved song available to this participant ID, or the remaining songs have already reached consensus.</p>
 </section>
 {% endif %}
 {% endblock %}

@@ -108,7 +108,11 @@ def index():
     song = None
     rated = total = 0
     if rater_key:
-        song, rated, total = _repository().next_song(rater_key)
+        song, rated, total = _repository().next_song(
+            rater_key,
+            current_app.config["MINIMUM_RATERS"],
+            current_app.config["MINIMUM_AGREEMENT"],
+        )
     return render_template(
         "rate.html",
         song=song,

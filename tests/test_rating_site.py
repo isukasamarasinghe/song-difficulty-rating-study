@@ -4,6 +4,7 @@ import unittest
 from collections import Counter
 
 from rating_app import create_app
+from rating_app.storage import SupabaseRepository
 
 
 class FakeRepository:
@@ -19,7 +20,12 @@ class FakeRepository:
         }
         self.saved_ratings: list[dict] = []
 
-    def next_song(self, rater_key: str):
+    def next_song(
+        self,
+        rater_key: str,
+        minimum_raters: int = 3,
+        minimum_agreement: float = 0.60,
+    ):
         completed = {
             row["song_id"]
             for row in self.saved_ratings
@@ -97,6 +103,65 @@ class FakeRepository:
         ]
 
 
+class InMemorySupabaseRepository(SupabaseRepository):
+    def __init__(self, songs: list[dict], ratings: list[dict]) -> None:
+        self._songs = songs
+        self._ratings = ratings
+
+    def songs(self, enabled_only: bool = True) -> list[dict]:
+        return self._songs
+
+    def ratings(self) -> list[dict]:
+        return self._ratings
+
+
+class ConsensusAssignmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.songs = [
+            {"song_id": song_id, "title": song_id, "artist": ""}
+            for song_id in ("accepted", "tied", "low", "needs")
+        ]
+        self.ratings = []
+
+        def add(song_id: str, difficulty: str, rater_key: str) -> None:
+            self.ratings.append(
+                {
+                    "song_id": song_id,
+                    "difficulty": difficulty,
+                    "rater_key": rater_key,
+                }
+            )
+
+        add("accepted", "Beginner", "accepted-1")
+        add("accepted", "Beginner", "accepted-2")
+        add("accepted", "Beginner", "accepted-3")
+        add("tied", "Beginner", "all")
+        add("tied", "Beginner", "tied-2")
+        add("tied", "Intermediate", "tied-3")
+        add("tied", "Intermediate", "tied-4")
+        add("low", "Beginner", "low-1")
+        add("low", "Intermediate", "all")
+        add("low", "Intermediate", "low-3")
+        add("low", "Advanced", "low-4")
+        add("needs", "Advanced", "all")
+
+        self.repository = InMemorySupabaseRepository(self.songs, self.ratings)
+
+    def test_only_unresolved_songs_are_assigned(self) -> None:
+        song, rated, total = self.repository.next_song("new-musician")
+
+        self.assertEqual(song["song_id"], "needs")
+        self.assertEqual(rated, 0)
+        self.assertEqual(total, 3)
+
+    def test_participant_never_receives_an_accepted_or_repeated_song(self) -> None:
+        song, rated, total = self.repository.next_song("all")
+
+        self.assertIsNone(song)
+        self.assertEqual(rated, 3)
+        self.assertEqual(total, 3)
+
+
 class RatingSiteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repository = FakeRepository()
@@ -154,7 +219,7 @@ class RatingSiteTests(unittest.TestCase):
                 },
                 follow_redirects=True,
             )
-            self.assertIn(b"All available songs are complete", rated.data)
+            self.assertIn(b"No unresolved songs are available to you", rated.data)
 
         with self.app.test_client() as admin:
             dashboard = admin.get(
